@@ -1,0 +1,252 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use diagnostics;
+use IO::Socket;
+use Unix::Syslog qw(:macros :subs);
+use Fcntl qw(:flock);
+use POSIX qw(:sys_wait_h setsid);
+use Getopt::Std;
+
+use lib qw(/opt/vmail/lib);
+use FlatPasswdFile;
+
+# Start logging to syslog
+my $syslog_id       = "sasld-vpasswd";
+my $syslog_facility = LOG_MAIL;
+Unix::Syslog::openlog($syslog_id, LOG_NOWAIT|LOG_PID, $syslog_facility);
+
+# Default values for cmdline options
+my $sockpath = "/var/run/sasld-vpasswd.socket";
+my $htpasswd = "/etc/vmail/vpasswd";
+my $lockfile = "/var/run/sasld-vpasswd.pid";
+my $group    = "postfix";
+
+# Option parsing:
+# ---------------
+# -s       Where to create the socket
+# -g       Group (name) that will have read/write access to the socket
+# -p       Passwd-filename
+# -d       Run in foreground 
+
+my %opts;
+getopts('s:g:p:dh?', \%opts);
+if ($opts{'h'} or $opts{'?'}){
+	usage();
+	exit 0;
+}
+if ($opts{'s'}){
+	$sockpath = $opts{'s'};
+}
+if ($opts{'g'}){
+	$group    = $opts{'g'};
+}
+if ($opts{'p'}){
+	$htpasswd = $opts{'p'};
+}
+
+if (-e $lockfile){
+	dolog('warning', "Lockfile $lockfile is already present. Aborting.");
+	exit 1;
+}
+
+if (-e $sockpath){
+	if (unlink $sockpath){
+		dolog('debug', "Cleaned up $sockpath.");
+	}else{
+		dolog('warning', "Trouble cleaning up $sockpath.");
+	}
+}
+my $socket = IO::Socket::UNIX->new (
+	Local  => $sockpath,
+	Type   => SOCK_STREAM,
+	Listen => 0
+	) or do {
+		dolog ('warning', "Died while creating socket $sockpath: $!");
+		exit 1;
+	};
+	
+chown $>, (getgrnam($group))[2], $sockpath;
+chmod 0770, $sockpath;
+dolog('debug', "Socket created: $sockpath");
+
+# Fork unless told otherwise
+unless ($opts{'d'}){
+	fork && exit;
+	open STDIN,  "/dev/null"  or die "STDIN </dev/null: $!\n";
+	open STDOUT, ">/dev/null" or die "STDOUT >/dev/null: $!\n";
+	open STDERR, ">/dev/null" or die "STDERR >/dev/null: $!\n";
+	setsid();
+}
+
+# Open Pidfile, write PID and lock it.
+open my $lock_fh, ">$lockfile" or do { dolog ('warning', "Could not create $lockfile: $!"); exit 1; };
+if (flock($lock_fh,LOCK_EX|LOCK_NB)){
+	dolog('debug', "Lockfile created: $lockfile");
+}else{
+        close $lock_fh;
+        dolog('warning', "Another instance of sasld-vpasswd seems to be running! Aborted.");
+	exit 1;
+}
+print $lock_fh "$$\n";
+select((select($lock_fh), $| = 1)[0]); # perlfaq5
+dolog('debug', "PID is: $$");
+
+my $killed = 0;
+my $signal;
+$SIG{CHLD} = \&reaper;
+$SIG{TERM} = sub { $killed = 1; $signal = "TERM"; };
+$SIG{INT}  = sub { $killed = 1; $signal = "INT"; };
+
+my %children;
+
+dolog('info', "Saslflatfile is up and running.");
+while (0 == $killed){
+	dolog('debug', "Awaiting connection.");
+	my $client = $socket->accept;
+	next unless ($client);
+	my $child = fork();
+	if (0 != $child){
+		dolog('debug', "Forked. Child is $child.");
+		# Parent does nothing but keep track of children
+		$children{$child} = $child;
+		close $client;
+	}else{
+		# Child handles the connection
+		close $socket;
+		$/ = "\000";
+
+		my $response;
+
+		my $name     = $client->getline();
+		my $username = $client->getline();
+		my $password = $client->getline();
+		my $service  = $client->getline();
+
+		check_input($name, $username, $password, $service) or
+			$response = "NO - Input corrupt";
+
+		$name     = clean_input($name);
+		$username = clean_input($username);
+		$password = clean_input($password);
+		$service  = clean_input($service);
+
+		no warnings;
+		dolog('debug', "\"$name\", \"$username\", \"$password\", \"$service\"");
+		use warnings;
+
+		if (FlatPasswdFile::check(FILE=>$htpasswd,USER=>$username,PASS=>$password)){
+			$response="OK - Password ok";
+		}else{
+			$response = "NO - Wrong login or password";
+		}
+
+		dolog('info', "Request by: $username, Returning: $response");
+
+		my $prepend = "\000".chr(length($response));
+		my $append  = "\000";
+		   $response = $prepend.$response.$append;
+		$client->printflush($response);
+
+		dolog('debug', "Child $$ closing socket and exiting.");
+		close $client;
+		exit;
+	}
+}
+
+dolog('info', "Killed! (By $signal signal.)\n");
+
+foreach my $child (keys(%children)){
+	dolog('debug', "Killing my children.");
+	$children{$child} = 0;
+	while ( kill 0 => $child){
+		dolog('debug', "Sending $child the TERM signal.");
+		kill TERM => $child;
+		if ($children{$child}++ > 5){
+			dolog('debug', "Giving up on $child, sending $child the KILL signal.");
+			kill KILL => $child;
+			last;
+		}
+		if ( kill 0 => $child ){
+			dolog('debug', "Failed to kill $child.");
+		}else{
+			dolog('debug', "Killed $child.");
+		}
+	}
+}
+	
+
+close $lock_fh;
+unlink $lockfile;
+dolog('info', "Exiting.\n");
+Unix::Syslog::closelog;
+exit;
+
+sub dolog{
+	my $severity = shift; # ('debug'|'info'|'warning')
+	my $message  = shift; 
+	chomp $message;
+	printf STDERR ("%8s: %s\n", $severity, $message);
+	$message =~ s/\%/\%\%/g;
+	if ($severity eq "debug"){
+		$severity = LOG_DEBUG;
+	}elsif($severity eq "info"){
+		$severity = LOG_INFO;
+	}elsif($severity eq "warning"){
+		$severity = LOG_WARNING;
+	}else{
+		$severity = LOG_INFO;
+	}
+
+	Unix::Syslog::syslog($severity, $message);
+}
+
+sub reaper{ 
+	foreach (keys(%children)){
+		if(my $pid = waitpid($_, WNOHANG)){
+			dolog('debug', "Reaped $pid.");
+			delete $children{$pid};
+		}
+	}
+}
+
+sub check_input{
+	foreach my $arg (@_){
+		chop $arg;
+		my ($count, $string) = split //, $arg, 2;
+		$count += 0;
+		$count = ord($count);
+		$string .= "";
+		unless ($count == length($string)){
+			return 0;
+		}
+	}
+	return 1;
+}
+	
+sub clean_input{
+	my $arg = shift;
+	$arg =~ s/\000*$//;
+	my ($count, $string) = split //, $arg, 2;
+	return $string;
+}
+	
+sub usage{
+	print <<End;
+sasld-vpasswd
+-------------
+This is a saslauthd replacement for authentication using a 
+htpasswd-style file.
+
+ -s       Where to create the socket 
+ -g       Group (name) that will have read/write access to the socket
+ -p       Passwd-filename
+ -d       Run in foreground 
+
+Use at your own risk!
+
+End
+}
+
+	
+
